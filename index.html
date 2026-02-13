@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>hand control · paddle game</title>
+  <!-- TensorFlow.js and HandPose -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@2.4.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      background: #0a1f2e;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-family: 'Courier New', Courier, monospace;
+    }
+    .game-container {
+      position: relative;
+      width: 720px;
+      height: 560px;
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 20px 30px rgba(0,0,0,0.6);
+      border: 2px solid #3fa7b0;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    #game-canvas {
+      z-index: 10;
+    }
+    #webcam-canvas {
+      z-index: 5;
+      transform: scaleX(-1); /* mirror effect – intuitive hand control */
+    }
+    .overlay-ui {
+      position: absolute;
+      bottom: 16px;
+      left: 0;
+      right: 0;
+      display: flex;
+      justify-content: center;
+      gap: 28px;
+      z-index: 20;
+      color: white;
+      text-shadow: 2px 2px 0 #0a1f2e;
+      font-weight: 700;
+      font-size: 1.2rem;
+      pointer-events: none;
+    }
+    .status {
+      position: absolute;
+      top: 16px;
+      left: 20px;
+      z-index: 25;
+      background: rgba(10,31,46,0.7);
+      color: #c7e9f0;
+      padding: 8px 20px;
+      border-radius: 50px;
+      backdrop-filter: blur(4px);
+      border: 1px solid #5bc8c0;
+      font-weight: bold;
+      letter-spacing: 2px;
+      pointer-events: none;
+    }
+    .restart-btn {
+      position: absolute;
+      top: 16px;
+      right: 20px;
+      z-index: 30;
+      background: #db3a34;
+      color: white;
+      border: none;
+      border-radius: 50px;
+      padding: 10px 24px;
+      font-weight: bold;
+      font-size: 1rem;
+      cursor: pointer;
+      border: 1px solid #ffb5a0;
+      box-shadow: 0 0 12px #db3a34aa;
+      transition: 0.2s;
+      font-family: inherit;
+    }
+    .restart-btn:hover {
+      background: #b82c24;
+      transform: scale(0.96);
+    }
+  </style>
+</head>
+<body>
+<div class="game-container">
+  <canvas id="webcam-canvas" width="720" height="560"></canvas>
+  <canvas id="game-canvas" width="720" height="560"></canvas>
+  <div class="status">🖐️ MOVE HAND → paddle follows</div>
+  <div class="overlay-ui">
+    <span>🏓 SCORE: <span id="score-display">0</span></span>
+    <span>❤️ LIVES: <span id="lives-display">3</span></span>
+  </div>
+  <button class="restart-btn" id="restart-btn">↻ NEW GAME</button>
+</div>
+
+<script>
+  (async function() {
+    // ----- GAME SETUP -----
+    const canvasGame = document.getElementById('game-canvas');
+    const canvasWebcam = document.getElementById('webcam-camvas'); // corrected id
+    // actually the second canvas is webcam-canvas
+    const webcamCanvas = document.getElementById('webcam-canvas');
+    const ctxGame = canvasGame.getContext('2d');
+    const ctxWebcam = webcamCanvas.getContext('2d');
+    
+    const scoreSpan = document.getElementById('score-display');
+    const livesSpan = document.getElementById('lives-display');
+    const restartBtn = document.getElementById('restart-btn');
+
+    // ----- GAME STATE -----
+    let ball = { x: 360, y: 300, dx: 5.2, dy: 4.8, radius: 8 };
+    let paddle = { x: 300, y: 520, width: 110, height: 18 };
+    let bricks = [];
+    let score = 0;
+    let lives = 3;
+    let gameActive = true;
+    let animationFrame;
+    let handXNormalized = 360; // fallback middle
+
+    // ----- BRICK GRID -----
+    const BRICK_COLS = 8;
+    const BRICK_ROWS = 4;
+    const BRICK_W = 74;
+    const BRICK_H = 24;
+    const BRICKS_OFFSET_X = 40;
+    const BRICKS_OFFSET_Y = 60;
+
+    function initBricks() {
+      bricks = [];
+      for (let r = 0; r < BRICK_ROWS; r++) {
+        for (let c = 0; c < BRICK_COLS; c++) {
+          bricks.push({
+            x: BRICKS_OFFSET_X + c * (BRICK_W + 8),
+            y: BRICKS_OFFSET_Y + r * (BRICK_H + 8),
+            w: BRICK_W,
+            h: BRICK_H,
+            active: true,
+            color: `hsl(${r * 30 + c * 15}, 70%, 58%)`
+          });
+        }
+      }
+    }
+    initBricks();
+
+    // ----- RESET BALL & PADDLE (keep hand position) -----
+    function resetBall() {
+      ball.x = 360;
+      ball.y = 400;
+      ball.dx = 5.2 * (Math.random() > 0.5 ? 1 : -1);
+      ball.dy = -5.0;
+    }
+
+    // restart full game
+    function restartGame() {
+      gameActive = true;
+      score = 0;
+      lives = 3;
+      updateUI();
+      initBricks();
+      resetBall();
+      // paddle x remains at current hand position, do not override
+    }
+
+    // update score/lives display
+    function updateUI() {
+      scoreSpan.textContent = score;
+      livesSpan.textContent = lives;
+    }
+
+    // ----- HAND POSE SETUP -----
+    let model;
+    let video;
+    let detecting = false;
+
+    async function initCameraAndModel() {
+      try {
+        video = document.createElement('video');
+        video.width = 720;
+        video.height = 560;
+        video.autoplay = true;
+        video.playsInline = true;
+        
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 720, height: 560, facingMode: 'user' }
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        // load handpose model
+        model = await handpose.load();
+        detecting = true;
+        detectHands();
+      } catch (e) {
+        console.error('webcam or model error:', e);
+        ctxGame.font = 'bold 20px Courier New';
+        ctxGame.fillStyle = 'white';
+        ctxGame.fillText('📷 allow webcam access', 200, 280);
+      }
+    }
+
+    // ----- HAND DETECTION LOOP -----
+    async function detectHands() {
+      if (!detecting || !model || !video) {
+        requestAnimationFrame(detectHands);
+        return;
+      }
+      
+      // estimate hand
+      try {
+        const predictions = await model.estimateHands(video);
+        // mirror webcam feed
+        ctxWebcam.save();
+        ctxWebcam.scale(-1, 1);
+        ctxWebcam.drawImage(video, -720, 0, 720, 560);
+        ctxWebcam.restore();
+
+        if (predictions.length > 0) {
+          // use index finger tip (landmark 8) for control
+          const keypoints = predictions[0].landmarks;
+          const indexTip = keypoints[8];  // [x, y, z]
+          
+          // mirror coordinate: video is flipped, but we want natural mapping
+          // original webcam: x 0..720, but we flipped context, so the coordinate is already mirrored?
+          // easier: handpose returns pixel in original video dimensions. we draw video flipped.
+          // we want: hand on left -> paddle left (mirror intuitive)
+          const rawX = indexTip[0]; // 0..720
+          // mirror it so left hand moves paddle left (as if looking in mirror)
+          const mirroredX = 720 - rawX;
+          // clamp to paddle boundaries
+          handXNormalized = Math.min(640 - paddle.width, Math.max(20, mirroredX - paddle.width/2));
+          paddle.x = handXNormalized;
+
+          // draw hand skeleton on webcam canvas (flipped)
+          drawHand(keypoints, ctxWebcam);
+        } else {
+          // no hand – keep paddle position as last known
+        }
+      } catch (err) {
+        console.warn('hand detection err', err);
+      }
+
+      requestAnimationFrame(detectHands);
+    }
+
+    // simple hand drawing (just landmarks + connections)
+    function drawHand(landmarks, ctx) {
+      ctx.save();
+      ctx.scale(-1, 1);             // mirror to match video
+      ctx.translate(-720, 0);
+      ctx.fillStyle = '#ffd966';
+      ctx.strokeStyle = '#ffeeaa';
+      ctx.lineWidth = 2;
+      
+      // draw finger tips bigger
+      const fingerIndices = [4, 8, 12, 16, 20];
+      fingerIndices.forEach(i => {
+        const [x, y] = landmarks[i];
+        ctx.beginPath();
+        ctx.arc(x, y, 8, 0, 2 * Math.PI);
+        ctx.fillStyle = '#ffb74d';
+        ctx.fill();
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#3fa7b0';
+      });
+      
+      // draw connections (simplified)
+      const connections = [
+        [0,1],[1,2],[2,3],[3,4],      // thumb
+        [0,5],[5,6],[6,7],[7,8],      // index
+        [0,9],[9,10],[10,11],[11,12], // middle
+        [0,13],[13,14],[14,15],[15,16], // ring
+        [0,17],[17,18],[18,19],[19,20]  // pinky
+      ];
+      ctx.beginPath();
+      ctx.strokeStyle = '#b0e6e6';
+      ctx.lineWidth = 2.5;
+      connections.forEach(([i,j]) => {
+        const [x1,y1] = landmarks[i];
+        const [x2,y2] = landmarks[j];
+        ctx.beginPath();
+        ctx.moveTo(x1,y1);
+        ctx.lineTo(x2,y2);
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    // ----- GAME LOOP (drawing & physics) -----
+    function gameLoop() {
+      if (!gameActive) {
+        // game over screen
+        ctxGame.clearRect(0, 0, 720, 560);
+        drawGameElements(); // show still background, bricks etc
+        ctxGame.font = 'bold 32px "Courier New"';
+        ctxGame.fillStyle = 'white';
+        ctxGame.shadowColor = 'black';
+        ctxGame.shadowBlur = 8;
+        ctxGame.fillText('💀 GAME OVER', 200, 280);
+        ctxGame.font = '18px "Courier New"';
+        ctxGame.fillText('press NEW GAME', 250, 350);
+        ctxGame.shadowBlur = 0;
+        animationFrame = requestAnimationFrame(gameLoop);
+        return;
+      }
+
+      // physics only if active
+      updateBall();
+      checkCollisions();
+
+      // draw everything
+      ctxGame.clearRect(0, 0, 720, 560);
+      
+      // draw decorative grid + bricks
+      drawGameElements();
+
+      // draw paddle
+      ctxGame.shadowBlur = 12;
+      ctxGame.shadowColor = '#3fa7b0';
+      ctxGame.fillStyle = '#6ee7e0';
+      ctxGame.beginPath();
+      ctxGame.roundRect(paddle.x, paddle.y, paddle.width, paddle.height, 12);
+      ctxGame.fill();
+      
+      // draw ball
+      ctxGame.shadowBlur = 16;
+      ctxGame.shadowColor = '#f7e05e';
+      ctxGame.fillStyle = '#ffe55c';
+      ctxGame.beginPath();
+      ctxGame.arc(ball.x, ball.y, ball.radius, 0, 2 * Math.PI);
+      ctxGame.fill();
+
+      // win condition
+      const activeBricks = bricks.filter(b => b.active).length;
+      if (activeBricks === 0) {
+        ctxGame.font = 'bold 28px "Courier New"';
+        ctxGame.fillStyle = '#ffde7a';
+        ctxGame.shadowBlur = 16;
+        ctxGame.fillText('✨ YOU WIN! ✨', 200, 300);
+      }
+
+      animationFrame = requestAnimationFrame(gameLoop);
+    }
+
+    // helper rounded rect
+    CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+      if (w < 2 * r) r = w / 2;
+      if (h < 2 * r) r = h / 2;
+      this.moveTo(x + r, y);
+      this.lineTo(x + w - r, y);
+      this.quadraticCurveTo(x + w, y, x + w, y + r);
+      this.lineTo(x + w, y + h - r);
+      this.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      this.lineTo(x + r, y + h);
+      this.quadraticCurveTo(x, y + h, x, y + h - r);
+      this.lineTo(x, y + r);
+      this.quadraticCurveTo(x, y, x + r, y);
+      return this;
+    };
+
+    function drawGameElements() {
+      // faint background
+      ctxGame.fillStyle = '#0e2a34';
+      ctxGame.fillRect(0, 0, 720, 560);
+      
+      // bricks
+      bricks.forEach(b => {
+        if (b.active) {
+          ctxGame.shadowBlur = 8;
+          ctxGame.shadowColor = '#00000055';
+          ctxGame.fillStyle = b.color;
+          ctxGame.beginPath();
+          ctxGame.roundRect(b.x, b.y, b.w, b.h, 8);
+          ctxGame.fill();
+        }
+      });
+      
+      // subtle net
+      ctxGame.strokeStyle = '#3c7c84';
+      ctxGame.lineWidth = 0.6;
+      ctxGame.setLineDash([6, 12]);
+      ctxGame.beginPath();
+      ctxGame.moveTo(0, 490);
+      ctxGame.lineTo(720, 490);
+      ctxGame.stroke();
+      ctxGame.setLineDash([]);
+    }
+
+    // ball physics & collisions
+    function updateBall() {
+      if (!gameActive) return;
+      
+      ball.x += ball.dx;
+      ball.y += ball.dy;
+
+      // left/right walls
+      if (ball.x - ball.radius < 0 || ball.x + ball.radius > 720) {
+        ball.dx *= -1;
+        ball.x = Math.min(Math.max(ball.x, ball.radius), 720 - ball.radius);
+      }
+      // top wall
+      if (ball.y - ball.radius < 0) {
+        ball.dy *= -1;
+        ball.y = ball.radius;
+      }
+
+      // paddle collision
+      if (ball.y + ball.radius > paddle.y && 
+          ball.y - ball.radius < paddle.y + paddle.height &&
+          ball.x + ball.radius > paddle.x && 
+          ball.x - ball.radius < paddle.x + paddle.width) {
+        
+        ball.dy = -Math.abs(ball.dy); // bounce up
+        // add horizontal effect based on offset
+        let offset = (ball.x - (paddle.x + paddle.width/2)) * 0.2;
+        ball.dx += offset;
+        // limit speed
+        ball.dx = Math.min(Math.max(ball.dx, -9), 9);
+        ball.dy -= 0.3; // little boost
+        ball.y = paddle.y - ball.radius; // prevent sticking
+      }
+
+      // bottom: lose life
+      if (ball.y + ball.radius > 560) {
+        lives--;
+        updateUI();
+        if (lives <= 0) {
+          gameActive = false;
+          lives = 0;
+          updateUI();
+        } else {
+          resetBall();
+        }
+      }
+    }
+
+    // brick collision
+    function checkCollisions() {
+      bricks.forEach(brick => {
+        if (!brick.active) return;
+        
+        const closestX = Math.max(brick.x, Math.min(ball.x, brick.x + brick.w));
+        const closestY = Math.max(brick.y, Math.min(ball.y, brick.y + brick.h));
+        const dx = ball.x - closestX;
+        const dy = ball.y - closestY;
+        const distance = Math.hypot(dx, dy);
+        
+        if (distance < ball.radius) {
+          // collision!
+          brick.active = false;
+          score += 10;
+          updateUI();
+          
+          // approximate bounce direction
+          if (Math.abs(dx) > Math.abs(dy)) {
+            ball.dx *= -1;
+          } else {
+            ball.dy *= -1;
+          }
+          // small speedup
+          ball.dx *= 1.02;
+          ball.dy *= 1.02;
+        }
+      });
+    }
+
+    // ----- START EVERYTHING -----
+    await initCameraAndModel();
+    gameLoop();
+
+    // restart handler
+    restartBtn.addEventListener('click', () => {
+      restartGame();
+    });
+
+    // clean up animation on page unload
+    window.addEventListener('beforeunload', () => {
+      cancelAnimationFrame(animationFrame);
+      detecting = false;
+      if (video && video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+      }
+    });
+  })();
+</script>
+</body>
+</html>
